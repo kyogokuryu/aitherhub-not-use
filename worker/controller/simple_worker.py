@@ -14,6 +14,22 @@ from threading import Lock, Thread
 from azure.storage.queue import QueueClient
 from dotenv import load_dotenv
 
+# systemd watchdog support
+def sd_notify(state: str):
+    """Send notification to systemd via sd_notify protocol."""
+    import socket
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        if addr[0] == "@":
+            addr = "\0" + addr[1:]
+        sock.sendto(state.encode(), addr)
+        sock.close()
+    except Exception:
+        pass
+
 # Load .env from project root
 project_root = Path(__file__).parent.parent.parent
 load_dotenv(project_root / ".env")
@@ -25,6 +41,9 @@ sys.path.insert(0, BATCH_DIR)
 
 # Maximum concurrent jobs
 MAX_WORKERS = int(os.getenv("WORKER_MAX_CONCURRENT", "1"))
+
+# Maximum retry attempts before treating message as poison and deleting it
+MAX_DEQUEUE_COUNT = int(os.getenv("WORKER_MAX_RETRIES", "5"))
 
 # Visibility timeout: 4 hours (video analysis can take 1-3 hours)
 VISIBILITY_TIMEOUT = 4 * 60 * 60  # 14400 seconds
@@ -293,6 +312,10 @@ def process_clip_job(payload: dict):
         return False
 
 
+# Timeout for video analysis subprocess (4 hours)
+VIDEO_PROCESS_TIMEOUT = int(os.getenv("WORKER_VIDEO_TIMEOUT", str(4 * 60 * 60)))
+
+
 def process_video_job(payload: dict):
     """Handle video analysis job."""
     video_id = payload.get("video_id")
@@ -310,17 +333,33 @@ def process_video_job(payload: dict):
         "--blob-url", blob_url,
     ]
 
-    result = subprocess.run(
-        cmd,
-        cwd=BATCH_DIR,
-        env={**os.environ, "PYTHONPATH": BATCH_DIR},
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=BATCH_DIR,
+            env={**os.environ, "PYTHONPATH": BATCH_DIR},
+            timeout=VIDEO_PROCESS_TIMEOUT,
+        )
 
-    if result.returncode == 0:
-        print(f"[worker] Batch completed successfully for {video_id}")
-        return True
-    else:
-        print(f"[worker] Batch failed for {video_id} with exit code {result.returncode}")
+        if result.returncode == 0:
+            print(f"[worker] Batch completed successfully for {video_id}")
+            return True
+        else:
+            print(f"[worker] Batch failed for {video_id} with exit code {result.returncode}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"[worker] Batch TIMED OUT for {video_id} after {VIDEO_PROCESS_TIMEOUT}s")
+        # Mark as ERROR so it doesn't stay stuck
+        try:
+            sys.path.insert(0, BATCH_DIR)
+            from db_ops import init_db_sync, update_video_status_sync, close_db_sync
+            from video_status import VideoStatus
+            init_db_sync()
+            update_video_status_sync(video_id, VideoStatus.ERROR)
+            close_db_sync()
+            print(f"[worker] Marked timed-out video {video_id} as ERROR")
+        except Exception as db_err:
+            print(f"[worker] Failed to mark timed-out video as ERROR: {db_err}")
         return False
 
 
@@ -353,6 +392,27 @@ def poll_and_process(executor: ThreadPoolExecutor):
             payload = json.loads(msg.content)
             job_type = payload.get("job_type", "video_analysis")
             job_id = payload.get("video_id", payload.get("clip_id", "unknown"))
+
+            # --- Poison message detection: delete after too many retries ---
+            if hasattr(msg, 'dequeue_count') and msg.dequeue_count is not None:
+                if msg.dequeue_count >= MAX_DEQUEUE_COUNT:
+                    print(f"[worker] POISON MESSAGE detected: job={job_id}, type={job_type}, "
+                          f"dequeue_count={msg.dequeue_count} >= {MAX_DEQUEUE_COUNT}. "
+                          f"Deleting message and marking video as ERROR.")
+                    delete_message_safe(msg.id, msg.pop_receipt)
+                    # Mark video as ERROR in DB so it doesn't stay in 'uploaded' forever
+                    if job_type in ("video_analysis", None) and job_id != "unknown":
+                        try:
+                            sys.path.insert(0, BATCH_DIR)
+                            from db_ops import init_db_sync, update_video_status_sync, close_db_sync
+                            from video_status import VideoStatus
+                            init_db_sync()
+                            update_video_status_sync(job_id, VideoStatus.ERROR)
+                            close_db_sync()
+                            print(f"[worker] Marked video {job_id} as ERROR")
+                        except Exception as db_err:
+                            print(f"[worker] Failed to mark video as ERROR: {db_err}")
+                    continue
 
             # --- live_monitor: runs on separate lightweight executor ---
             if job_type == "live_monitor":
@@ -412,6 +472,41 @@ def acquire_lock():
         sys.exit(1)
 
 
+# Disk cleanup interval: run every 30 minutes
+DISK_CLEANUP_INTERVAL = 30 * 60  # 1800 seconds
+_last_disk_cleanup = 0
+
+
+def periodic_disk_cleanup():
+    """Periodically check disk space and clean up old files.
+    Delegates to the centralised disk_guard module so that ALL temp
+    directories (uploadedvideo, output, splitvideo, artifacts, logs)
+    are covered in one place."""
+    global _last_disk_cleanup
+    now = time.time()
+    if now - _last_disk_cleanup < DISK_CLEANUP_INTERVAL:
+        return
+    _last_disk_cleanup = now
+
+    try:
+        # Ensure disk_guard runs with the correct cwd
+        original_cwd = os.getcwd()
+        os.chdir(BATCH_DIR)
+
+        from disk_guard import periodic_disk_check
+
+        # Collect currently active video IDs
+        active_ids = set()
+        with active_jobs_lock:
+            active_ids = set(active_jobs.keys())
+
+        periodic_disk_check(active_ids=active_ids)
+
+        os.chdir(original_cwd)
+    except Exception as e:
+        print(f"[worker][disk] Cleanup error: {e}")
+
+
 def main():
     # Acquire lock to prevent duplicate instances
     lock_fp = acquire_lock()
@@ -429,11 +524,20 @@ def main():
     renewal_thread = Thread(target=visibility_renewal_loop, daemon=True)
     renewal_thread.start()
 
+    # Initial disk cleanup on startup
+    periodic_disk_cleanup()
+
+    # Notify systemd that we're ready
+    sd_notify("READY=1")
+    print("[worker] Notified systemd: READY")
+
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     try:
         while not shutdown_requested:
             try:
+                sd_notify("WATCHDOG=1")  # Tell systemd we're alive
+                periodic_disk_cleanup()
                 poll_and_process(executor)
                 time.sleep(5)  # Poll every 5 seconds
             except Exception as e:

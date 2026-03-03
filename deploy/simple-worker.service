@@ -1,0 +1,48 @@
+[Unit]
+Description=Simple Queue Worker
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/var/www/aitherhub
+EnvironmentFile=/var/www/aitherhub/.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/var/www/aitherhub/.venv/bin/python /var/www/aitherhub/worker/controller/simple_worker.py
+
+# --- Auto-restart on failure ---
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# --- Watchdog: worker must notify every 5 minutes or get killed ---
+WatchdogSec=300
+# If watchdog triggers, count as failure and restart
+WatchdogSignal=SIGABRT
+
+# --- Memory protection ---
+# Limit worker memory to 20GB (leaves 7GB for OS + ffmpeg subprocesses)
+MemoryMax=20G
+MemoryHigh=16G
+
+# --- Process limits ---
+# Allow enough PIDs for ffmpeg subprocesses
+TasksMax=256
+
+# Allow up to 4 hours for graceful shutdown (video processing can take 1-3 hours)
+TimeoutStopSec=14400
+
+# Send SIGTERM first, wait for graceful shutdown
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging
+StandardOutput=append:/var/www/aitherhub/worker.log
+StandardError=append:/var/www/aitherhub/worker.log
+
+[Install]
+WantedBy=multi-user.target
