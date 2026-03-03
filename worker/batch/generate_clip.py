@@ -65,12 +65,20 @@ WHISPER_ENDPOINT = os.getenv("WHISPER_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_OPENAI_KEY")
 FFMPEG_BIN = os.getenv("FFMPEG_PATH", "ffmpeg")
 
-# OpenAI client for GPT-4o subtitle post-processing
+# Azure OpenAI client for GPT-4o subtitle post-processing
 try:
-    from openai import OpenAI
-    _openai_client = OpenAI()
+    from openai import AzureOpenAI as _AzureOpenAI
+    _azure_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT', '')
+    # Strip path from endpoint URL if present (keep only base URL)
+    if '/openai/' in _azure_endpoint:
+        _azure_endpoint = _azure_endpoint.split('/openai/')[0]
+    _openai_client = _AzureOpenAI(
+        api_key=os.getenv('AZURE_OPENAI_KEY'),
+        azure_endpoint=_azure_endpoint,
+        api_version=os.getenv('GPT5_API_VERSION', '2025-04-01-preview'),
+    )
 except Exception as e:
-    logger.warning(f"OpenAI client init failed: {e}")
+    logger.warning(f"Azure OpenAI client init failed: {e}")
     _openai_client = None
 
 # Font configuration – Noto Sans CJK JP (installed via fonts-noto-cjk package)
@@ -476,7 +484,7 @@ JSON配列のみ出力（説明不要）:"""
 
     try:
         response = _openai_client.responses.create(
-            model="gpt-4o",
+            model="gpt-4o",  # Azure OpenAI deployment name
             input=[
                 {"role": "system", "content": "あなたは日本語ライブコマース字幕の修正専門家です。JSON配列のみを出力してください。"},
                 {"role": "user", "content": prompt},

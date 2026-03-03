@@ -414,6 +414,22 @@ def poll_and_process(executor: ThreadPoolExecutor):
                             print(f"[worker] Failed to mark video as ERROR: {db_err}")
                     continue
 
+            # --- Orphan message detection: video_id not in DB → delete immediately ---
+            if job_type in ("video_analysis", None) and job_id != "unknown":
+                try:
+                    sys.path.insert(0, BATCH_DIR)
+                    from db_ops import init_db_sync, get_user_id_of_video_sync, close_db_sync
+                    init_db_sync()
+                    owner = get_user_id_of_video_sync(job_id)
+                    close_db_sync()
+                    if owner is None:
+                        print(f"[worker] ORPHAN MESSAGE: video_id={job_id} not found in DB. "
+                              f"Deleting message (dequeue_count={getattr(msg, 'dequeue_count', '?')}).")
+                        delete_message_safe(msg.id, msg.pop_receipt)
+                        continue
+                except Exception as db_err:
+                    print(f"[worker] DB check failed for {job_id}, proceeding anyway: {db_err}")
+
             # --- live_monitor: runs on separate lightweight executor ---
             if job_type == "live_monitor":
                 with live_monitor_lock:

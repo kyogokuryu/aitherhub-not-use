@@ -134,7 +134,20 @@ def extract_frames(
         logger.info("[FRAMES] Using CPU decode (gpu=%s, codec=%s, cuvid=%s)",
                     has_gpu, codec, cuvid_decoder)
 
-    import threading, time as _time
+    import threading, time as _time, shutil
+
+    # --- Disk space pre-check ---
+    disk = shutil.disk_usage(out_dir)
+    free_gb = disk.free / (1024 ** 3)
+    # Estimate required space: ~120KB per frame (JPG 1280px)
+    estimated_gb = (expected_frames * 120 * 1024) / (1024 ** 3) if expected_frames > 0 else 5.0
+    logger.info("[FRAMES] Disk free: %.1f GB, estimated need: %.1f GB", free_gb, estimated_gb)
+    if free_gb < max(estimated_gb * 1.2, 3.0):
+        raise RuntimeError(
+            f"[FRAMES] Insufficient disk space: {free_gb:.1f} GB free, "
+            f"need ~{estimated_gb:.1f} GB for {expected_frames} frames. "
+            f"Clean up old files first."
+        )
 
     # Run ffmpeg in background so we can monitor progress
     proc = subprocess.Popen(
@@ -143,9 +156,15 @@ def extract_frames(
         stderr=subprocess.PIPE,
     )
 
+    # --- Stall detection: if no new frames for STALL_TIMEOUT seconds, kill ffmpeg ---
+    STALL_TIMEOUT = 120  # 2 minutes with no progress = stalled
+    _stall_detected = {"value": False}
+
     if on_progress and expected_frames > 0:
         def _monitor():
             last_pct = -1
+            last_count = 0
+            stall_start = _time.time()
             while proc.poll() is None:
                 try:
                     count = len([f for f in os.listdir(out_dir) if f.endswith('.jpg')])
@@ -153,18 +172,54 @@ def extract_frames(
                     if pct != last_pct:
                         on_progress(pct)
                         last_pct = pct
+                    # Stall detection
+                    if count > last_count:
+                        last_count = count
+                        stall_start = _time.time()
+                    elif count == last_count and count > 0:
+                        stall_sec = _time.time() - stall_start
+                        if stall_sec > STALL_TIMEOUT:
+                            # Check disk space
+                            disk_now = shutil.disk_usage(out_dir)
+                            free_now = disk_now.free / (1024 ** 3)
+                            logger.error(
+                                "[FRAMES] STALL DETECTED: no new frames for %ds "
+                                "(count=%d, disk_free=%.1f GB). Killing ffmpeg.",
+                                int(stall_sec), count, free_now,
+                            )
+                            _stall_detected["value"] = True
+                            proc.kill()
+                            return
                 except Exception:
                     pass
-                _time.sleep(1)
-            on_progress(100)
+                _time.sleep(2)
+            if not _stall_detected["value"]:
+                on_progress(100)
 
         t = threading.Thread(target=_monitor, daemon=True)
         t.start()
 
     proc.wait()
 
-    # If GPU failed, fallback to CPU
-    if proc.returncode != 0 and use_gpu:
+    if _stall_detected["value"] and use_gpu:
+        # GPU stall detected - fall through to CPU fallback instead of raising
+        logger.warning(
+            "[FRAMES] GPU stall detected (no new frames for %ds). "
+            "Extracted %d of %d expected frames. Falling back to CPU.",
+            STALL_TIMEOUT,
+            len([f for f in os.listdir(out_dir) if f.endswith('.jpg')]),
+            expected_frames,
+        )
+    elif _stall_detected["value"] and not use_gpu:
+        # CPU-only mode stalled - this is a real error
+        raise RuntimeError(
+            f"[FRAMES] ffmpeg stalled (no new frames for {STALL_TIMEOUT}s). "
+            f"Likely disk full. Extracted {len([f for f in os.listdir(out_dir) if f.endswith('.jpg')])} "
+            f"of {expected_frames} expected frames."
+        )
+
+    # If GPU failed or stalled, fallback to CPU
+    if (proc.returncode != 0 or _stall_detected["value"]) and use_gpu:
         stderr_out = proc.stderr.read().decode(errors='replace') if proc.stderr else ''
         logger.warning("[FRAMES] GPU decode failed (rc=%d), falling back to CPU. stderr: %s",
                        proc.returncode, stderr_out[:500])
@@ -188,9 +243,13 @@ def extract_frames(
             stderr=subprocess.DEVNULL,
         )
 
+        _stall_detected2 = {"value": False}
+
         if on_progress and expected_frames > 0:
             def _monitor2():
                 last_pct = -1
+                last_count = 0
+                stall_start = _time.time()
                 while proc2.poll() is None:
                     try:
                         count = len([f for f in os.listdir(out_dir) if f.endswith('.jpg')])
@@ -198,15 +257,38 @@ def extract_frames(
                         if pct != last_pct:
                             on_progress(pct)
                             last_pct = pct
+                        if count > last_count:
+                            last_count = count
+                            stall_start = _time.time()
+                        elif count == last_count and count > 0:
+                            stall_sec = _time.time() - stall_start
+                            if stall_sec > STALL_TIMEOUT:
+                                disk_now = shutil.disk_usage(out_dir)
+                                free_now = disk_now.free / (1024 ** 3)
+                                logger.error(
+                                    "[FRAMES] CPU STALL DETECTED: no new frames for %ds "
+                                    "(count=%d, disk_free=%.1f GB). Killing ffmpeg.",
+                                    int(stall_sec), count, free_now,
+                                )
+                                _stall_detected2["value"] = True
+                                proc2.kill()
+                                return
                     except Exception:
                         pass
-                    _time.sleep(1)
-                on_progress(100)
+                    _time.sleep(2)
+                if not _stall_detected2["value"]:
+                    on_progress(100)
 
             t2 = threading.Thread(target=_monitor2, daemon=True)
             t2.start()
 
         proc2.wait()
+
+        if _stall_detected2["value"]:
+            raise RuntimeError(
+                f"[FRAMES] ffmpeg CPU fallback stalled (no new frames for {STALL_TIMEOUT}s). "
+                f"Likely disk full."
+            )
 
     if on_progress:
         on_progress(100)
