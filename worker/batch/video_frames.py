@@ -223,20 +223,49 @@ def extract_frames(
         stderr_out = proc.stderr.read().decode(errors='replace') if proc.stderr else ''
         logger.warning("[FRAMES] GPU decode failed (rc=%d), falling back to CPU. stderr: %s",
                        proc.returncode, stderr_out[:500])
-        # Clean partial output
-        for f in os.listdir(out_dir):
-            if f.endswith('.jpg'):
-                os.remove(os.path.join(out_dir, f))
 
-        cmd_cpu = [
-            FFMPEG_BIN, "-y",
-            "-threads", "0",
-            "-i", video_path,
-            "-vf", f"fps={fps},scale=1280:-1",
-            "-q:v", "5",
-            "-vsync", "0",
-            os.path.join(out_dir, "frame_%08d.jpg"),
-        ]
+        # Count existing GPU-extracted frames
+        existing_frames = sorted([f for f in os.listdir(out_dir) if f.endswith('.jpg')])
+        gpu_frame_count = len(existing_frames)
+
+        if gpu_frame_count > 10 and expected_frames > 0:
+            # OPTIMIZATION: Keep GPU frames, only extract remaining with CPU
+            # GPU frames are named frame_00000001.jpg, ..., frame_NNNNNNNN.jpg
+            # Start CPU extraction from where GPU left off
+            start_sec = gpu_frame_count / fps  # approximate start time
+            remaining_frames = expected_frames - gpu_frame_count
+            # Use start_number so filenames continue from GPU's last frame
+            start_number = gpu_frame_count + 1
+            logger.info(
+                "[FRAMES] GPU partial recovery: keeping %d GPU frames, "
+                "extracting remaining ~%d frames from %.0fs with CPU",
+                gpu_frame_count, remaining_frames, start_sec,
+            )
+            cmd_cpu = [
+                FFMPEG_BIN, "-y",
+                "-threads", "0",
+                "-ss", str(start_sec),
+                "-i", video_path,
+                "-vf", f"fps={fps},scale=1280:-1",
+                "-q:v", "5",
+                "-vsync", "0",
+                "-start_number", str(start_number),
+                os.path.join(out_dir, "frame_%08d.jpg"),
+            ]
+        else:
+            # Few or no GPU frames - clean and start fresh
+            logger.info("[FRAMES] GPU extracted only %d frames, starting CPU from scratch", gpu_frame_count)
+            for f in existing_frames:
+                os.remove(os.path.join(out_dir, f))
+            cmd_cpu = [
+                FFMPEG_BIN, "-y",
+                "-threads", "0",
+                "-i", video_path,
+                "-vf", f"fps={fps},scale=1280:-1",
+                "-q:v", "5",
+                "-vsync", "0",
+                os.path.join(out_dir, "frame_%08d.jpg"),
+            ]
         proc2 = subprocess.Popen(
             cmd_cpu,
             stdout=subprocess.DEVNULL,
