@@ -43,13 +43,13 @@ sys.path.insert(0, BATCH_DIR)
 MAX_WORKERS = int(os.getenv("WORKER_MAX_CONCURRENT", "1"))
 
 # Maximum retry attempts before treating message as poison and deleting it
-MAX_DEQUEUE_COUNT = int(os.getenv("WORKER_MAX_RETRIES", "5"))
+MAX_DEQUEUE_COUNT = int(os.getenv("WORKER_MAX_RETRIES", "3"))
 
-# Visibility timeout: 4 hours (video analysis can take 1-3 hours)
-VISIBILITY_TIMEOUT = 4 * 60 * 60  # 14400 seconds
+# Visibility timeout: 15 minutes (renewed every 5 min while job is active)
+VISIBILITY_TIMEOUT = 15 * 60  # 900 seconds
 
-# Visibility renewal interval: renew every 30 minutes to keep message invisible
-VISIBILITY_RENEW_INTERVAL = 30 * 60  # 1800 seconds
+# Visibility renewal interval: renew every 5 minutes to keep message invisible
+VISIBILITY_RENEW_INTERVAL = 5 * 60  # 300 seconds
 
 # Track active jobs: job_id -> {"future": Future, "msg_id": str, "pop_receipt": str}
 active_jobs: dict[str, dict] = {}
@@ -285,7 +285,7 @@ def process_clip_job(payload: dict):
     phase_index = payload.get("phase_index", -1)
     speed_factor = payload.get("speed_factor", 1.0)
 
-    print(f"[worker] Starting clip generation for clip_id={clip_id} (speed={speed_factor}x)")
+    print(f"[worker] Starting clip generation for clip_id={clip_id} (speed={speed_factor}x, timeout={CLIP_PROCESS_TIMEOUT}s)")
     cmd = [
         sys.executable,
         os.path.join(BATCH_DIR, "generate_clip.py"),
@@ -298,22 +298,30 @@ def process_clip_job(payload: dict):
         "--speed-factor", str(speed_factor),
     ]
 
-    result = subprocess.run(
-        cmd,
-        cwd=BATCH_DIR,
-        env={**os.environ, "PYTHONPATH": BATCH_DIR},
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=BATCH_DIR,
+            env={**os.environ, "PYTHONPATH": BATCH_DIR},
+            timeout=CLIP_PROCESS_TIMEOUT,
+        )
 
-    if result.returncode == 0:
-        print(f"[worker] Clip generation completed for {clip_id}")
-        return True
-    else:
-        print(f"[worker] Clip generation failed for {clip_id} with exit code {result.returncode}")
+        if result.returncode == 0:
+            print(f"[worker] Clip generation completed for {clip_id}")
+            return True
+        else:
+            print(f"[worker] Clip generation failed for {clip_id} with exit code {result.returncode}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"[worker] Clip generation TIMED OUT for {clip_id} after {CLIP_PROCESS_TIMEOUT}s")
         return False
 
 
-# Timeout for video analysis subprocess (4 hours)
-VIDEO_PROCESS_TIMEOUT = int(os.getenv("WORKER_VIDEO_TIMEOUT", str(4 * 60 * 60)))
+# Timeout for video analysis subprocess (20 minutes hard limit)
+VIDEO_PROCESS_TIMEOUT = int(os.getenv("WORKER_VIDEO_TIMEOUT", str(20 * 60)))
+
+# Timeout for clip generation subprocess (10 minutes)
+CLIP_PROCESS_TIMEOUT = int(os.getenv("WORKER_CLIP_TIMEOUT", str(10 * 60)))
 
 
 def process_video_job(payload: dict):
@@ -533,7 +541,9 @@ def main():
 
     print(f"[worker] Starting simple queue worker (max_concurrent={MAX_WORKERS})...")
     print(f"[worker] Queue: {os.getenv('AZURE_QUEUE_NAME', 'video-jobs')}")
-    print(f"[worker] Visibility timeout: {VISIBILITY_TIMEOUT}s ({VISIBILITY_TIMEOUT // 3600}h)")
+    print(f"[worker] Visibility timeout: {VISIBILITY_TIMEOUT}s ({VISIBILITY_TIMEOUT // 60}min, renewed every {VISIBILITY_RENEW_INTERVAL // 60}min)")
+    print(f"[worker] Video process timeout: {VIDEO_PROCESS_TIMEOUT}s ({VIDEO_PROCESS_TIMEOUT // 60}min)")
+    print(f"[worker] Max retries (dequeue count): {MAX_DEQUEUE_COUNT}")
     print(f"[worker] Message deletion: after successful completion only (retry on failure)")
 
     # Start background visibility renewal thread
