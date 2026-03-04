@@ -8,7 +8,8 @@ from functools import partial
 from openai import AzureOpenAI, RateLimitError, APIError, APITimeoutError
 from decouple import config
 
-# v3: 4→20 for speed optimization (fewer total calls due to CSV filter)
+# v4: Keep 20 for STEP 4 (fewer total calls, only rep_frames)
+# But improve retry logic for rate limits
 MAX_CONCURRENCY = 20
 
 # =========================
@@ -69,8 +70,9 @@ def encode_image(path):
 async def gpt_image_caption_async(
     image_path: str,
     sem: asyncio.Semaphore,
-    max_retry: int = 3,
+    max_retry: int = 5,
 ):
+    """v4: Improved retry with separate 429 handling and longer backoff."""
     async with sem:
         loop = asyncio.get_event_loop()
 
@@ -81,13 +83,24 @@ async def gpt_image_caption_async(
                     partial(gpt_image_caption, image_path)
                 )
 
-            except (RateLimitError, APITimeoutError, APIError):
+            except RateLimitError:
+                # v4: Longer backoff for rate limits
+                sleep_time = (3 ** attempt) + random.uniform(0.5, 2.0)
+                print(
+                    f"[CAPTION][429] {os.path.basename(image_path)} "
+                    f"attempt {attempt + 1}/{max_retry}, "
+                    f"sleep {sleep_time:.1f}s"
+                )
+                await asyncio.sleep(sleep_time)
+
+            except (APITimeoutError, APIError):
                 sleep_time = (2 ** attempt) + random.uniform(0, 0.5)
                 await asyncio.sleep(sleep_time)
 
             except Exception:
                 return None
 
+        print(f"[CAPTION][FAIL] {os.path.basename(image_path)} after {max_retry} retries")
         return None
 
 

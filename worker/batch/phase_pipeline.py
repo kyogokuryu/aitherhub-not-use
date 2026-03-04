@@ -4,6 +4,7 @@ import base64
 import json
 import time
 import random
+import threading
 
 from db_ops import insert_video_phase_sync
 from openai import AzureOpenAI, RateLimitError, APIError, APITimeoutError
@@ -11,8 +12,10 @@ from decouple import config
 import asyncio
 from functools import partial
 
-# v3: 8→20 for speed optimization
-MAX_CONCURRENCY = 20
+# v4: STEP 2 concurrency reduced 20→10 to avoid rate limiting
+# STEP 6 keeps 20 (text-only, much smaller tokens)
+STEP2_MAX_CONCURRENCY = 10
+STEP6_MAX_CONCURRENCY = 20
 
 
 # ======================================================
@@ -31,9 +34,74 @@ AZURE_OPENAI_ENDPOINT = env("AZURE_OPENAI_ENDPOINT")
 GPT5_API_VERSION = env("GPT5_API_VERSION")
 GPT5_MODEL = env("GPT5_MODEL")
 
-# Max number of frames to scan forward/backward
-# when GPT fails to read viewer_count at phase boundary
-MAX_FALLBACK = 20
+# v4: Reduced from 20→3. Analysis shows most readings succeed
+# within first 1-2 frames or never succeed at all.
+# 20 fallback × 244 phases × 2 = 9760 API calls → 3 × 244 × 2 = 1464
+MAX_FALLBACK = 3
+
+# ======================================================
+# ADAPTIVE RATE LIMITER
+# ======================================================
+
+class AdaptiveRateLimiter:
+    """
+    Dynamically adjusts concurrency based on 429 error rate.
+    When rate limit errors spike, reduces active semaphore slots.
+    When errors subside, gradually restores concurrency.
+    """
+    def __init__(self, initial_concurrency: int):
+        self._max = initial_concurrency
+        self._current = initial_concurrency
+        self._lock = threading.Lock()
+        self._error_count = 0
+        self._success_count = 0
+        self._window_start = time.time()
+        self._WINDOW_SEC = 30  # evaluate every 30 seconds
+
+    def record_success(self):
+        with self._lock:
+            self._success_count += 1
+            self._maybe_adjust()
+
+    def record_rate_limit(self):
+        with self._lock:
+            self._error_count += 1
+            self._maybe_adjust()
+
+    def _maybe_adjust(self):
+        now = time.time()
+        if now - self._window_start < self._WINDOW_SEC:
+            return
+        total = self._error_count + self._success_count
+        if total < 5:
+            self._window_start = now
+            self._error_count = 0
+            self._success_count = 0
+            return
+        error_rate = self._error_count / total
+        old = self._current
+        if error_rate > 0.5:
+            # Heavy rate limiting → halve concurrency (min 2)
+            self._current = max(2, self._current // 2)
+        elif error_rate > 0.2:
+            # Moderate rate limiting → reduce by 1
+            self._current = max(2, self._current - 1)
+        elif error_rate < 0.05 and self._current < self._max:
+            # Very few errors → increase by 1
+            self._current = min(self._max, self._current + 1)
+        if old != self._current:
+            print(f"[RATE-LIMITER] Concurrency adjusted: {old} → {self._current} "
+                  f"(error_rate={error_rate:.1%}, window={total} calls)")
+        self._window_start = now
+        self._error_count = 0
+        self._success_count = 0
+
+    @property
+    def current_concurrency(self) -> int:
+        return self._current
+
+# Global rate limiter instance for STEP 2
+_step2_rate_limiter = AdaptiveRateLimiter(STEP2_MAX_CONCURRENCY)
 
 
 client = AzureOpenAI(
@@ -84,11 +152,13 @@ def encode_image(path):
 async def gpt_read_header_async(
     image_path: str,
     sem: asyncio.Semaphore,
-    max_retry: int = 3,
+    max_retry: int = 5,
+    rate_limiter: AdaptiveRateLimiter = None,
 ):
     """
-    Async wrapper for gpt_read_header with:
+    v4: Async wrapper for gpt_read_header with:
     - semaphore concurrency control
+    - adaptive rate limiting (reduces concurrency on 429 errors)
     - retry on rate-limit / transient errors
     - exponential backoff + jitter
 
@@ -102,26 +172,40 @@ async def gpt_read_header_async(
 
         for attempt in range(max_retry):
             try:
-                return await loop.run_in_executor(
+                result = await loop.run_in_executor(
                     None,
                     partial(gpt_read_header, image_path)
                 )
+                if rate_limiter:
+                    rate_limiter.record_success()
+                return result
 
-            except (RateLimitError, APITimeoutError, APIError) as e:
+            except RateLimitError as e:
+                if rate_limiter:
+                    rate_limiter.record_rate_limit()
+                # v4: Longer backoff for rate limits (base 3s instead of 2s)
+                sleep_time = (3 ** attempt) + random.uniform(0.5, 2.0)
+                print(
+                    f"[VISION][429] {os.path.basename(image_path)} "
+                    f"attempt {attempt + 1}/{max_retry}, "
+                    f"sleep {sleep_time:.1f}s"
+                )
+                await asyncio.sleep(sleep_time)
+
+            except (APITimeoutError, APIError) as e:
                 sleep_time = (2 ** attempt) + random.uniform(0, 0.5)
                 print(
-                    f"[VISION][RETRY] {image_path} "
+                    f"[VISION][RETRY] {os.path.basename(image_path)} "
                     f"attempt {attempt + 1}/{max_retry}, "
                     f"sleep {sleep_time:.1f}s ({type(e).__name__})"
                 )
                 await asyncio.sleep(sleep_time)
 
             except Exception as e:
-                # lỗi không xác định → không retry vô hạn
-                print(f"[VISION][ERROR] {image_path}: {e}")
+                print(f"[VISION][ERROR] {os.path.basename(image_path)}: {e}")
                 return None
 
-        print(f"[VISION][FAIL] {image_path} after {max_retry} retries")
+        print(f"[VISION][FAIL] {os.path.basename(image_path)} after {max_retry} retries")
         return None
 
 async def process_one_task(task, files, frame_dir, sem, phase_results):
@@ -165,10 +249,11 @@ async def process_phase_role(
     frame_dir,
     sem,
     phase_results,
+    rate_limiter=None,
 ):
 
     best = {"viewer_count": None, "like_count": None}
-    used_idx = base_idx  # mặc định là frame gốc
+    used_idx = base_idx
 
     offsets = range(0, MAX_FALLBACK + 1)
 
@@ -179,8 +264,7 @@ async def process_phase_role(
 
         path = os.path.join(frame_dir, files[idx])
 
-        # semaphore + retry đã nằm trong gpt_read_header_async
-        data = await gpt_read_header_async(path, sem)
+        data = await gpt_read_header_async(path, sem, rate_limiter=rate_limiter)
 
         if isinstance(data, dict):
             before = dict(best)
@@ -365,11 +449,18 @@ def read_phase_end(files, frame_dir, frame_idx):
 def extract_phase_stats(keyframes, total_frames, frame_dir):
     files = sorted(os.listdir(frame_dir))
     extended = [0] + keyframes + [total_frames]
+    num_phases = len(extended) - 1
+
+    # v4: Log expected API calls for monitoring
+    max_calls = num_phases * 2 * (MAX_FALLBACK + 1)
+    print(f"[STEP2] {num_phases} phases, MAX_FALLBACK={MAX_FALLBACK}, "
+          f"max API calls={max_calls}, concurrency={STEP2_MAX_CONCURRENCY}")
 
     phase_results = {}
+    rate_limiter = _step2_rate_limiter
 
     async def runner():
-        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        sem = asyncio.Semaphore(STEP2_MAX_CONCURRENCY)
         tasks = []
 
         for i in range(len(extended) - 1):
@@ -380,13 +471,15 @@ def extract_phase_stats(keyframes, total_frames, frame_dir):
             tasks.append(
                 process_phase_role(
                     phase_idx, "start", start,
-                    files, frame_dir, sem, phase_results
+                    files, frame_dir, sem, phase_results,
+                    rate_limiter=rate_limiter,
                 )
             )
             tasks.append(
                 process_phase_role(
                     phase_idx, "end", end,
-                    files, frame_dir, sem, phase_results
+                    files, frame_dir, sem, phase_results,
+                    rate_limiter=rate_limiter,
                 )
             )
 
@@ -731,7 +824,7 @@ def build_phase_descriptions(phase_units, on_progress=None):
             on_progress(pct)
 
     async def runner():
-        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        sem = asyncio.Semaphore(STEP6_MAX_CONCURRENCY)
         tasks = []
 
         for phase in phase_units:
@@ -804,8 +897,9 @@ async def gpt_phase_description_async(
     image_caption: str,
     speech_text: str,
     sem: asyncio.Semaphore,
-    max_retry: int = 3,
+    max_retry: int = 5,
 ):
+    """v4: Improved retry with separate 429 handling."""
     async with sem:
         loop = asyncio.get_event_loop()
 
@@ -820,7 +914,11 @@ async def gpt_phase_description_async(
                     )
                 )
 
-            except (RateLimitError, APITimeoutError, APIError):
+            except RateLimitError:
+                sleep_time = (3 ** attempt) + random.uniform(0.5, 2.0)
+                await asyncio.sleep(sleep_time)
+
+            except (APITimeoutError, APIError):
                 sleep_time = (2 ** attempt) + random.uniform(0, 0.5)
                 await asyncio.sleep(sleep_time)
 

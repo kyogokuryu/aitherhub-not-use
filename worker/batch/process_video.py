@@ -835,17 +835,17 @@ def main():
             time_key = _detect_time_key(trends)
             sample = trends[0] if trends else {}
 
-            # CSVカラム名を自動検出
-            gmv_key = _find_key(sample, ["gmv", "GMV", "成交金额"])
-            order_key = _find_key(sample, ["成交件数", "订单数", "orders"])
-            viewer_key = _find_key(sample, ["观看人数", "viewers", "viewer_count"])
-            like_key = _find_key(sample, ["点赞数", "likes", "like_count"])
-            comment_key = _find_key(sample, ["评论数", "comments", "comment_count"])
-            share_key = _find_key(sample, ["分享次数", "shares", "share_count"])
-            follower_key = _find_key(sample, ["新增粉丝数", "new_followers"])
-            click_key = _find_key(sample, ["商品点击量", "product_clicks"])
-            conv_key = _find_key(sample, ["点击成交转化率", "click_conversion"])
-            gpm_key = _find_key(sample, ["千次观看成交金额", "gmv_per_1k_views", "GPM"])
+            # CSVカラム名を自動検出（SellerCompass API形式 + 従来の中国語形式に対応）
+            gmv_key = _find_key(sample, ["gmv", "GMV", "成交金额", "gmv_metric_name_short_ui"])
+            order_key = _find_key(sample, ["成交件数", "订单数", "orders", "live_workbench_metric_orders_new", "orders_metric_name_short_ui", "seller_screen_live_core_data_created_orders"])
+            viewer_key = _find_key(sample, ["观看人数", "viewers", "viewer_count", "live_dashboard_follower_analytics_viewer", "live_workbench_metric_views"])
+            like_key = _find_key(sample, ["点赞数", "likes", "like_count", "live_workbench_metric_likes"])
+            comment_key = _find_key(sample, ["评论数", "comments", "comment_count", "live_workbench_metric_comments"])
+            share_key = _find_key(sample, ["分享次数", "shares", "share_count", "live_workbench_metric_shares"])
+            follower_key = _find_key(sample, ["新增粉丝数", "new_followers", "seller_screen_live_core_data_new_followers"])
+            click_key = _find_key(sample, ["商品点击量", "product_clicks", "live_workbench_metric_product_clicks"])
+            conv_key = _find_key(sample, ["点击成交转化率", "click_conversion", "ctor_metric_name_short_ui", "live_workbench_metric_co_new"])
+            gpm_key = _find_key(sample, ["千次观看成交金额", "gmv_per_1k_views", "GPM", "live_workbench_basic_core_data_gpm", "live_workbench_metric_show_gpm_new"])
 
             logger.info("[CSV_METRICS] Detected keys: gmv=%s, order=%s, viewer=%s, like=%s, comment=%s, share=%s, follower=%s, click=%s, conv=%s, gpm=%s",
                 gmv_key, order_key, viewer_key, like_key, comment_key, share_key, follower_key, click_key, conv_key, gpm_key)
