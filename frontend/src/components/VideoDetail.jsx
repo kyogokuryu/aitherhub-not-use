@@ -7,6 +7,7 @@ import VideoService from "../base/services/videoService";
 import "../assets/css/sidebar.css";
 import AnalyticsSection from "./AnalyticsSection";
 import ClipSection from "./ClipSection";
+import LiveReportSection from "./LiveReportSection";
 // ProductTimeline is now integrated into AnalyticsSection
 
 export default function VideoDetail({ videoData }) {
@@ -610,6 +611,13 @@ export default function VideoDetail({ videoData }) {
               handlePhasePreview({ time_start: timeStart, time_end: timeEnd });
             }}
           />
+
+          {/* Live Report v1 - 3-layer report */}
+          <div className="w-full mt-2 mx-auto">
+            <div className="rounded-2xl bg-gray-50 border border-gray-200 p-4 md:p-5">
+              <LiveReportSection videoData={videoData} />
+            </div>
+          </div>
 
           {/* Product Timeline is now integrated into AnalyticsSection above */}
 

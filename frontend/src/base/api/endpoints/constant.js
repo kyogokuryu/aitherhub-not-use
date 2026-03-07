@@ -27,4 +27,7 @@ export const URL_CONSTANTS = {
   LIVE_START_MONITOR: "/api/v1/live",   // /{video_id}/start-monitor
   LIVE_PUSH_EVENTS: "/api/v1/live",     // /{video_id}/events
   LIVE_ACTIVE: "/api/v1/live/active",
+  // Live Report v1
+  REPORT_GENERATE: "/api/v1/reports",  // /{video_id}/generate
+  REPORT_GET: "/api/v1/reports",        // /{video_id}
 };

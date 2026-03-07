@@ -806,6 +806,38 @@ class VideoService extends BaseApiService {
       },
     };
   }
+
+  // ── Live Report v1 ─────────────────────────────────────
+
+  /**
+   * Generate Live Report v1 for a video.
+   * @param {string} videoId - Video ID
+   * @returns {Promise} Report data
+   */
+  async generateLiveReport(videoId) {
+    try {
+      const response = await this.post(`${URL_CONSTANTS.REPORT_GENERATE}/${videoId}/generate`);
+      return response;
+    } catch (error) {
+      console.error('Failed to generate live report:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get the latest Live Report for a video.
+   * @param {string} videoId - Video ID
+   * @returns {Promise} Report data
+   */
+  async getLiveReport(videoId) {
+    try {
+      const response = await this.get(`${URL_CONSTANTS.REPORT_GET}/${videoId}`);
+      return response;
+    } catch (error) {
+      console.error('Failed to get live report:', error);
+      throw error;
+    }
+  }
 }
 
 export default new VideoService();
